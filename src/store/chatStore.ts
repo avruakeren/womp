@@ -466,7 +466,10 @@ export const useChatStore = create<ChatStore>((set, get) => {
 
     // Add Friend / Send Request
     sendFriendRequest: async (targetUsername) => {
-      const sanitized = targetUsername.toLowerCase().trim();
+      let sanitized = targetUsername.toLowerCase().trim();
+      if (sanitized.startsWith('@')) {
+        sanitized = sanitized.substring(1);
+      }
       const current = get().currentUser;
       if (!current) return false;
 
