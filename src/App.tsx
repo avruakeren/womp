@@ -350,11 +350,11 @@ export default function App() {
                             <div className="item-header">
                               <span className="item-title">@{friend.username}</span>
                               {lastMsg && (
-                                <span className="item-meta">{formatTime(lastMsg.timestamp)}</span>
+                                <span className="item-meta">{formatTime(lastMsg.createdAt)}</span>
                               )}
                             </div>
                             <div className="item-subtitle">
-                              {lastMsg ? lastMsg.text : 'Obrolan terenkripsi aman'}
+                              {lastMsg ? lastMsg.content : 'Obrolan terenkripsi aman'}
                             </div>
                           </div>
                         </div>
