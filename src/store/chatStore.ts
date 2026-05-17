@@ -1,26 +1,21 @@
 import { create } from 'zustand';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
-import * as webCrypto from '../crypto/webCrypto';
-import * as keyStore from '../crypto/keyStore';
+
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface UserProfile {
   id: string;
   username: string;
   avatarUrl?: string;
-  publicIdentityKey?: string;
-  isOnline?: boolean;
 }
 
-export interface LocalMessage {
+export interface Message {
   id: string;
   senderId: string;
   recipientId: string;
-  text: string; // Plaintext (only decoded in memory!)
-  ciphertext: string;
-  iv: string;
-  timestamp: string;
-  isDelivered: boolean;
-  isEncrypted: boolean;
+  content: string;
+  isRead: boolean;
+  createdAt: string;
 }
 
 export interface FriendRequest {
@@ -28,129 +23,97 @@ export interface FriendRequest {
   sender: UserProfile;
 }
 
-interface ToastMessage {
+export interface Toast {
   id: string;
   message: string;
   type: 'info' | 'success' | 'warning';
 }
 
 interface ChatStore {
-  // Authentication & Profile
   currentUser: UserProfile | null;
   isAuthenticated: boolean;
   isLoading: boolean;
-  
-  // Realtime Status
   isLiveMode: boolean;
-  isWsConnected: boolean;
 
-  // Conversations & Contacts
   friends: UserProfile[];
   pendingRequests: FriendRequest[];
   activeFriendId: string | null;
-  messages: { [friendId: string]: LocalMessage[] };
-  toasts: ToastMessage[];
+  messages: Record<string, Message[]>;
+  toasts: Toast[];
 
-  addToast: (message: string, type?: 'info' | 'success' | 'warning') => void;
+  addToast: (msg: string, type?: Toast['type']) => void;
   removeToast: (id: string) => void;
-  
+
   initializeSession: () => Promise<void>;
   registerUser: (username: string, password: string) => Promise<boolean>;
   loginUser: (username: string, password: string) => Promise<boolean>;
-  logoutUser: () => Promise<void>;
-  
-  sendFriendRequest: (targetUsername: string) => Promise<boolean>;
+  logoutUser: () => void;
+
+  sendFriendRequest: (username: string) => Promise<boolean>;
   acceptFriendRequest: (requestId: string) => Promise<void>;
   rejectFriendRequest: (requestId: string) => Promise<void>;
-  
-  sendMessage: (text: string) => Promise<void>;
+
+  sendMessage: (content: string) => Promise<void>;
   selectActiveChat: (friendId: string) => void;
-  
-  updateAvatar: (avatarDataUrl: string) => Promise<void>;
-  syncSupabaseData: (userId: string) => Promise<void>;
+  updateAvatar: (dataUrl: string) => Promise<void>;
+
+  syncData: (userId: string) => Promise<void>;
 }
 
-// Helper to generate a random UUID for simulated mode
-const generateUUID = () => crypto.randomUUID();
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+const uid = () => crypto.randomUUID();
+
+async function hashPassword(password: string, username: string): Promise<string> {
+  const data = new TextEncoder().encode(password + ':' + username.toLowerCase());
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// ─── Store ────────────────────────────────────────────────────────────────────
 
 export const useChatStore = create<ChatStore>((set, get) => {
-  
-  // Channel registry: track all subscribed pair channels
-  let friendshipChannel: any = null;
-  const pairChannels: Map<string, any> = new Map();
+  let realtimeChannel: ReturnType<typeof supabase.channel> | null = null;
 
-  // Deterministic shared channel ID for any two users
-  const getPairChannelId = (userA: string, userB: string) =>
-    `womp:pair:${[userA, userB].sort().join('_')}`;
-
-  // Subscribe to friendship-level realtime (friend requests only)
-  const setupFriendshipChannel = (userId: string) => {
+  const setupRealtime = (userId: string) => {
     if (!isSupabaseConfigured()) return;
-    if (friendshipChannel) return; // Already subscribed
+    if (realtimeChannel) {
+      realtimeChannel.unsubscribe();
+      realtimeChannel = null;
+    }
 
-    friendshipChannel = supabase
-      .channel(`womp:meta:${userId}`)
-      .on('postgres_changes', {
-        event: '*',
-        schema: 'public',
-        table: 'friendships'
-      }, async () => {
-        await get().syncSupabaseData(userId);
-      })
-      .subscribe((status) => {
-        set({ isWsConnected: status === 'SUBSCRIBED' });
-      });
-  };
-
-  // Subscribe to a shared pair channel with a specific friend
-  const subscribeToFriendChannel = (myId: string, friendId: string) => {
-    if (!isSupabaseConfigured()) return;
-    const channelId = getPairChannelId(myId, friendId);
-    if (pairChannels.has(channelId)) return; // Already subscribed
-
-    const ch = supabase
-      .channel(channelId)
-      .on('broadcast', { event: 'new-message' }, async (payload) => {
-        const { senderId, ciphertext, iv, msgId } = payload.payload;
-
-        // Ignore messages sent by self (we already show them locally)
-        if (senderId === myId) return;
-
-        const sessionKey = await keyStore.getSessionKey(senderId);
-        if (!sessionKey) {
-          get().addToast('Pesan masuk, tapi kunci handshake belum ada.', 'warning');
-          return;
-        }
-
-        try {
-          const decryptedText = await webCrypto.decryptMessage({ ciphertext, iv }, sessionKey);
-          const newMsg: LocalMessage = {
-            id: msgId || generateUUID(),
-            senderId,
-            recipientId: myId,
-            text: decryptedText,
-            ciphertext,
-            iv,
-            timestamp: new Date().toISOString(),
-            isDelivered: true,
-            isEncrypted: true
+    realtimeChannel = supabase
+      .channel(`womp_user_${userId}`)
+      // New incoming messages
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'messages', filter: `recipient_id=eq.${userId}` },
+        (payload) => {
+          const row = payload.new as any;
+          const msg: Message = {
+            id: row.id,
+            senderId: row.sender_id,
+            recipientId: row.recipient_id,
+            content: row.content,
+            isRead: row.is_read,
+            createdAt: row.created_at,
           };
-
           set((state) => {
-            const current = state.messages[senderId] || [];
-            if (current.some(m => m.id === newMsg.id)) return state;
+            const existing = state.messages[msg.senderId] || [];
+            if (existing.some(m => m.id === msg.id)) return state;
             return {
-              messages: { ...state.messages, [senderId]: [...current, newMsg] }
+              messages: { ...state.messages, [msg.senderId]: [...existing, msg] },
             };
           });
-        } catch (err) {
-          console.error('Decryption failed:', err);
-          get().addToast('Gagal mendekripsi pesan.', 'warning');
         }
-      })
+      )
+      // Friend request updates
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'friendships' },
+        () => { get().syncData(userId); }
+      )
       .subscribe();
-
-    pairChannels.set(channelId, ch);
   };
 
   return {
@@ -158,809 +121,457 @@ export const useChatStore = create<ChatStore>((set, get) => {
     isAuthenticated: false,
     isLoading: false,
     isLiveMode: isSupabaseConfigured(),
-    isWsConnected: false,
     friends: [],
     pendingRequests: [],
     activeFriendId: null,
     messages: {},
     toasts: [],
 
-    // Toast Actions
+    // ── Toast ──────────────────────────────────────────────────────────────
     addToast: (message, type = 'info') => {
-      const id = generateUUID();
-      set((state) => ({
-        toasts: [...state.toasts, { id, message, type }]
-      }));
+      const id = uid();
+      set(s => ({ toasts: [...s.toasts, { id, message, type }] }));
       setTimeout(() => get().removeToast(id), 4000);
     },
-    removeToast: (id) => set((state) => ({
-      toasts: state.toasts.filter((t) => t.id !== id)
-    })),
+    removeToast: (id) => set(s => ({ toasts: s.toasts.filter(t => t.id !== id) })),
 
-    // Session recovery on start
+    // ── Session restore ────────────────────────────────────────────────────
     initializeSession: async () => {
-      set({ isLoading: true });
+      const raw = localStorage.getItem('womp-user');
+      if (!raw) return;
       try {
-        const storedUser = localStorage.getItem('womp-current-user');
-        if (storedUser) {
-          const parsedUser = JSON.parse(storedUser);
-          
-          // Verify if local private keys exist in IndexedDB
-          const privKey = await keyStore.getMyKey('identity-private');
-          if (privKey) {
-            set({ currentUser: parsedUser, isAuthenticated: true });
-            get().addToast(`Sesi dipulihkan. Kunci E2EE dimuat dari IndexedDB!`, 'success');
-            
-            if (isSupabaseConfigured()) {
-              setupFriendshipChannel(parsedUser.id);
-              await get().syncSupabaseData(parsedUser.id);
-            } else {
-              // Load mock simulation data
-              get().addToast('Menjalankan dalam Mode Simulasi (Konfigurasi Supabase kosong)', 'info');
-              
-              // Load initial mock friends
-              set({
-                friends: [
-                  { id: 'mock-bob-id', username: 'bob_secure', isOnline: true },
-                  { id: 'mock-charlie-id', username: 'charlie_crypto', isOnline: false }
-                ],
-                pendingRequests: [
-                  {
-                    id: 'req-david',
-                    sender: { id: 'mock-david-id', username: 'david_e2ee' }
-                  }
-                ]
-              });
-
-              // Generate mock shared keys for Simulation Bob & Charlie
-              const myPrivKey = await keyStore.getMyKey('identity-private') as CryptoKey;
-              
-              const fakeBobKeyPair = await webCrypto.generateE2EEKeyPair();
-              const derivedBobKey = await webCrypto.deriveSharedSessionKey(myPrivKey, fakeBobKeyPair.publicKey);
-              await keyStore.saveSessionKey('mock-bob-id', derivedBobKey);
-
-              const fakeCharlieKeyPair = await webCrypto.generateE2EEKeyPair();
-              const derivedCharlieKey = await webCrypto.deriveSharedSessionKey(myPrivKey, fakeCharlieKeyPair.publicKey);
-              await keyStore.saveSessionKey('mock-charlie-id', derivedCharlieKey);
-            }
-          } else {
-            localStorage.removeItem('womp-current-user');
-          }
+        const user = JSON.parse(raw) as UserProfile;
+        set({ currentUser: user, isAuthenticated: true });
+        if (isSupabaseConfigured()) {
+          setupRealtime(user.id);
+          await get().syncData(user.id);
         }
-      } catch (err) {
-        console.error('Session init error', err);
-      } finally {
-        set({ isLoading: false });
+      } catch {
+        localStorage.removeItem('womp-user');
       }
     },
 
-    // User Registration
+    // ── Register ───────────────────────────────────────────────────────────
     registerUser: async (username, password) => {
       set({ isLoading: true });
       try {
-        // 1. Client-side deterministic hash of password
-        await webCrypto.hashPasswordClientSide(password, username);
-
-        // 2. Generate local E2EE Key Pair
-        const identityKeys = await webCrypto.generateE2EEKeyPair();
-        const publicIdentityKeyBase64 = await webCrypto.exportPublicKey(identityKeys.publicKey);
-        await webCrypto.exportPrivateKey(identityKeys.privateKey);
-
-        // Save raw keys in local IndexedDB
-        await keyStore.saveMyKey('identity-private', identityKeys.privateKey);
-        await keyStore.saveMyKey('identity-public', identityKeys.publicKey);
-
-        // Generate profile symmetric key
-        const profileKey = await webCrypto.generateProfileKey();
-        await keyStore.saveMyKey('profile-key', profileKey);
-
-        const newUserId = generateUUID();
-        const userData: UserProfile = {
-          id: newUserId,
-          username: username.toLowerCase(),
-          publicIdentityKey: publicIdentityKeyBase64
-        };
+        const clean = username.toLowerCase().trim();
+        if (!clean || clean.length < 3) throw new Error('Username minimal 3 karakter.');
+        if (!password || password.length < 6) throw new Error('Password minimal 6 karakter.');
 
         if (isSupabaseConfigured()) {
-          // Check if username already exists in Supabase
-          const { data: existingUser } = await supabase
+          // Check existing username
+          const { data: existing } = await supabase
             .from('profiles')
-            .select('username')
-            .eq('username', username.toLowerCase())
+            .select('id')
+            .eq('username', clean)
             .maybeSingle();
 
-          if (existingUser) {
-            throw new Error('Username sudah terpakai. Silakan pilih username lain.');
-          }
+          if (existing) throw new Error('Username sudah dipakai.');
 
-          // Supabase signup (Direct base64 string storage!)
-          const { error } = await supabase.from('profiles').insert({
-            id: newUserId,
-            username: username.toLowerCase(),
-            public_identity_key: publicIdentityKeyBase64,
-          });
+          const passwordHash = await hashPassword(password, clean);
+
+          const { data, error } = await supabase
+            .from('profiles')
+            .insert({ username: clean, password_hash: passwordHash })
+            .select('id, username, avatar_url')
+            .single();
+
           if (error) throw error;
-        }
 
-        // Save session locally
-        localStorage.setItem('womp-current-user', JSON.stringify(userData));
-        set({ currentUser: userData, isAuthenticated: true });
-        
-        get().addToast('Registrasi Sukses! Kunci E2EE disimpan di perangkat.', 'success');
-        
-        if (isSupabaseConfigured()) {
-          setupSupabaseRealtime(newUserId);
-          await get().syncSupabaseData(newUserId);
+          const user: UserProfile = { id: data.id, username: data.username, avatarUrl: data.avatar_url };
+          localStorage.setItem('womp-user', JSON.stringify(user));
+          set({ currentUser: user, isAuthenticated: true });
+          setupRealtime(user.id);
+          await get().syncData(user.id);
         } else {
-          // Init Simulation Mode
-          set({
-            friends: [
-              { id: 'mock-bob-id', username: 'bob_secure', isOnline: true }
-            ]
-          });
-          // Setup mock keys
-          const derivedBobKey = await webCrypto.deriveSharedSessionKey(identityKeys.privateKey, (await webCrypto.generateE2EEKeyPair()).publicKey);
-          await keyStore.saveSessionKey('mock-bob-id', derivedBobKey);
+          // Simulation
+          const user: UserProfile = { id: uid(), username: clean };
+          localStorage.setItem('womp-user', JSON.stringify(user));
+          set({ currentUser: user, isAuthenticated: true });
+          set({ friends: [{ id: 'sim-bob', username: 'bob_sim' }] });
         }
 
+        get().addToast('Akun berhasil dibuat!', 'success');
         return true;
       } catch (err: any) {
-        console.error(err);
-        get().addToast(`Pendaftaran gagal: ${err.message || err}`, 'warning');
+        get().addToast(err.message || 'Registrasi gagal.', 'warning');
         return false;
       } finally {
         set({ isLoading: false });
       }
     },
 
-    // User Login (Zero-Knowledge Authenticate)
+    // ── Login ──────────────────────────────────────────────────────────────
     loginUser: async (username, password) => {
       set({ isLoading: true });
       try {
-        await webCrypto.hashPasswordClientSide(password, username);
-        
-        let targetUserId = generateUUID();
-        
+        const clean = username.toLowerCase().trim();
+
         if (isSupabaseConfigured()) {
-          // Fetch existing profile from Supabase
-          const { data: serverProfile, error: searchErr } = await supabase
+          const { data: profile, error } = await supabase
             .from('profiles')
             .select('*')
-            .eq('username', username.toLowerCase())
+            .eq('username', clean)
             .maybeSingle();
 
-          if (searchErr || !serverProfile) {
-            throw new Error('Username tidak terdaftar. Silakan bikin akun baru.');
-          }
+          if (error || !profile) throw new Error('Username tidak ditemukan.');
 
-          targetUserId = serverProfile.id;
+          const passwordHash = await hashPassword(password, clean);
+          if (profile.password_hash !== passwordHash) throw new Error('Password salah.');
 
-          // Check if local private key exists for this session
-          const existingPrivKey = await keyStore.getMyKey('identity-private');
-          
-          if (!existingPrivKey) {
-            // New device / cleared IndexedDB. Generate a new keypair and update server profile.
-            get().addToast('Browser baru terdeteksi. Membuat kunci E2EE baru (kunci lama terhapus).', 'info');
-            
-            const identityKeys = await webCrypto.generateE2EEKeyPair();
-            await keyStore.saveMyKey('identity-private', identityKeys.privateKey);
-            await keyStore.saveMyKey('identity-public', identityKeys.publicKey);
-            
-            const profileKey = await webCrypto.generateProfileKey();
-            await keyStore.saveMyKey('profile-key', profileKey);
-
-            // Export and update on Supabase (Direct Base64 String!)
-            const publicIdentityKeyBase64 = await webCrypto.exportPublicKey(identityKeys.publicKey);
-            const { error: updateErr } = await supabase
-              .from('profiles')
-              .update({
-                public_identity_key: publicIdentityKeyBase64
-              })
-              .eq('id', targetUserId);
-
-            if (updateErr) throw updateErr;
-          }
+          const user: UserProfile = { id: profile.id, username: profile.username, avatarUrl: profile.avatar_url };
+          localStorage.setItem('womp-user', JSON.stringify(user));
+          set({ currentUser: user, isAuthenticated: true });
+          setupRealtime(user.id);
+          await get().syncData(user.id);
         } else {
-          // Simulation backup check
-          const existingPrivKey = await keyStore.getMyKey('identity-private');
-          if (!existingPrivKey) {
-            const identityKeys = await webCrypto.generateE2EEKeyPair();
-            await keyStore.saveMyKey('identity-private', identityKeys.privateKey);
-            await keyStore.saveMyKey('identity-public', identityKeys.publicKey);
-            
-            const profileKey = await webCrypto.generateProfileKey();
-            await keyStore.saveMyKey('profile-key', profileKey);
-          }
+          const raw = localStorage.getItem('womp-user');
+          if (!raw) throw new Error('Belum ada akun. Silakan daftar.');
+          const user = JSON.parse(raw) as UserProfile;
+          set({ currentUser: user, isAuthenticated: true });
         }
 
-        const userData: UserProfile = {
-          id: targetUserId,
-          username: username.toLowerCase()
-        };
-
-        localStorage.setItem('womp-current-user', JSON.stringify(userData));
-        set({ currentUser: userData, isAuthenticated: true });
-        
-        get().addToast(`Login sukses! Kunci E2EE diaktifkan.`, 'success');
-
-        if (isSupabaseConfigured()) {
-          setupSupabaseRealtime(targetUserId);
-          await get().syncSupabaseData(targetUserId);
-        } else {
-          set({
-            friends: [
-              { id: 'mock-bob-id', username: 'bob_secure', isOnline: true }
-            ]
-          });
-          // Setup mock keys
-          const myPriv = await keyStore.getMyKey('identity-private') as CryptoKey;
-          const derivedBobKey = await webCrypto.deriveSharedSessionKey(myPriv, (await webCrypto.generateE2EEKeyPair()).publicKey);
-          await keyStore.saveSessionKey('mock-bob-id', derivedBobKey);
-        }
-
+        get().addToast('Login berhasil!', 'success');
         return true;
       } catch (err: any) {
-        console.error(err);
-        get().addToast(err.message || 'Gagal masuk.', 'warning');
+        get().addToast(err.message || 'Login gagal.', 'warning');
         return false;
       } finally {
         set({ isLoading: false });
       }
     },
 
-    // User Logout
-    logoutUser: async () => {
-      try {
-        if (realtimeChannel) {
-          realtimeChannel.unsubscribe();
-        }
-        await keyStore.clearAllLocalKeys();
-        localStorage.removeItem('womp-current-user');
-        set({
-          currentUser: null,
-          isAuthenticated: false,
-          friends: [],
-          pendingRequests: [],
-          activeFriendId: null,
-          messages: {}
-        });
-        get().addToast('Logged out. Kunci E2EE aman terhapus dari perangkat.', 'info');
-      } catch (err) {
-        console.error('Logout error', err);
-      }
+    // ── Logout ─────────────────────────────────────────────────────────────
+    logoutUser: () => {
+      realtimeChannel?.unsubscribe();
+      realtimeChannel = null;
+      localStorage.removeItem('womp-user');
+      set({ currentUser: null, isAuthenticated: false, friends: [], pendingRequests: [], messages: {}, activeFriendId: null });
     },
 
-    // Add Friend / Send Request
-    sendFriendRequest: async (targetUsername) => {
-      let sanitized = targetUsername.toLowerCase().trim();
-      if (sanitized.startsWith('@')) {
-        sanitized = sanitized.substring(1);
-      }
+    // ── Friend request ─────────────────────────────────────────────────────
+    sendFriendRequest: async (username) => {
       const current = get().currentUser;
       if (!current) return false;
 
-      if (sanitized === current.username) {
-        get().addToast('Anda tidak bisa berteman dengan diri sendiri.', 'warning');
+      let target = username.toLowerCase().trim();
+      if (target.startsWith('@')) target = target.slice(1);
+
+      if (target === current.username) {
+        get().addToast('Tidak bisa berteman dengan diri sendiri.', 'warning');
         return false;
       }
-
-      // Check if already friends
-      if (get().friends.some(f => f.username === sanitized)) {
-        get().addToast('User ini sudah berteman dengan Anda.', 'warning');
+      if (get().friends.some(f => f.username === target)) {
+        get().addToast('Sudah berteman.', 'warning');
         return false;
       }
-
-      get().addToast(`Mengirim request ke @${sanitized}...`, 'info');
 
       try {
         if (isSupabaseConfigured()) {
-          // Fetch target profile public key from Supabase
-          const { data: targetProfile, error } = await supabase
+          const { data: targetProfile } = await supabase
             .from('profiles')
-            .select('*')
-            .eq('username', sanitized)
+            .select('id, username')
+            .eq('username', target)
             .maybeSingle();
 
-          if (error || !targetProfile) {
+          if (!targetProfile) {
             get().addToast('Pengguna tidak ditemukan.', 'warning');
             return false;
           }
 
-          // Check if request already exists in friendships
-          const { data: existingFriendship } = await supabase
+          const { data: existing } = await supabase
             .from('friendships')
-            .select('*')
+            .select('id')
             .or(`and(requester_id.eq.${current.id},addressee_id.eq.${targetProfile.id}),and(requester_id.eq.${targetProfile.id},addressee_id.eq.${current.id})`)
             .maybeSingle();
 
-          if (existingFriendship) {
-            get().addToast('Permintaan pertemanan sudah dikirim sebelumnya.', 'warning');
+          if (existing) {
+            get().addToast('Request sudah pernah dikirim.', 'warning');
             return false;
           }
 
-          // Create friendship request in Supabase
-          const { error: insertErr } = await supabase.from('friendships').insert({
+          const { error } = await supabase.from('friendships').insert({
             requester_id: current.id,
             addressee_id: targetProfile.id,
-            status: 'pending'
           });
-          if (insertErr) throw insertErr;
+          if (error) throw error;
         } else {
-          // Simulation mode: automatically accept friend after 1.5 seconds!
-          setTimeout(async () => {
-            const myPrivKey = await keyStore.getMyKey('identity-private') as CryptoKey;
-            
-            // Generate Bob public key simulation
-            const targetKeyPair = await webCrypto.generateE2EEKeyPair();
-            const targetPubBase64 = await webCrypto.exportPublicKey(targetKeyPair.publicKey);
-            
-            // Derive shared E2EE key locally
-            const sessionKey = await webCrypto.deriveSharedSessionKey(myPrivKey, targetKeyPair.publicKey);
-            
-            // Save derived key under Bob's new mock ID
-            const newFriendId = 'mock-' + sanitized + '-id';
-            await keyStore.saveSessionKey(newFriendId, sessionKey);
-
-            set((state) => ({
-              friends: [
-                ...state.friends,
-                { id: newFriendId, username: sanitized, isOnline: true, publicIdentityKey: targetPubBase64 }
-              ]
-            }));
-
-            get().addToast(`@${sanitized} menyetujui pertemanan. Handshake E2EE selesai!`, 'success');
-          }, 1500);
+          // Simulation: auto-accept after 1s
+          setTimeout(() => {
+            const newFriend = { id: 'sim-' + target, username: target };
+            set(s => ({ friends: [...s.friends, newFriend] }));
+            get().addToast(`@${target} menerima pertemanan!`, 'success');
+          }, 1000);
         }
 
-        get().addToast(`Request terkirim ke @${sanitized}`, 'success');
+        get().addToast(`Request terkirim ke @${target}`, 'success');
         return true;
-      } catch (err) {
-        console.error(err);
-        get().addToast('Gagal menambah teman.', 'warning');
+      } catch (err: any) {
+        get().addToast(err.message || 'Gagal kirim request.', 'warning');
         return false;
       }
     },
 
-    // Accept friend request
+    // ── Accept ─────────────────────────────────────────────────────────────
     acceptFriendRequest: async (requestId) => {
-      const request = get().pendingRequests.find(r => r.id === requestId);
-      if (!request) return;
-
-      get().addToast('Menyetujui request pertemanan...', 'info');
+      const req = get().pendingRequests.find(r => r.id === requestId);
+      if (!req) return;
 
       try {
-        const myPrivKey = await keyStore.getMyKey('identity-private') as CryptoKey;
-
         if (isSupabaseConfigured()) {
-          // Update friendship status
-          const { error: updateErr } = await supabase
+          const { error } = await supabase
             .from('friendships')
             .update({ status: 'accepted' })
             .eq('id', requestId);
-          
-          if (updateErr) throw updateErr;
-          
-          // Download friend's public key (Clean base64!)
-          const friendPubKeyObj = await webCrypto.importPublicKey(request.sender.publicIdentityKey!);
-          
-          // Derive shared key
-          const derivedKey = await webCrypto.deriveSharedSessionKey(myPrivKey, friendPubKeyObj);
-          await keyStore.saveSessionKey(request.sender.id, derivedKey);
-        } else {
-          // Simulated approval
-          const friendKeyPair = await webCrypto.generateE2EEKeyPair();
-          const derived = await webCrypto.deriveSharedSessionKey(myPrivKey, friendKeyPair.publicKey);
-          await keyStore.saveSessionKey(request.sender.id, derived);
+          if (error) throw error;
         }
 
-        set((state) => ({
-          friends: [...state.friends, { ...request.sender, isOnline: true }],
-          pendingRequests: state.pendingRequests.filter(r => r.id !== requestId)
+        set(s => ({
+          friends: [...s.friends, req.sender],
+          pendingRequests: s.pendingRequests.filter(r => r.id !== requestId),
         }));
 
-        get().addToast(`Handshake E2EE selesai. Sekarang terhubung dengan @${request.sender.username}!`, 'success');
-        
+        // Fetch offline messages from this friend
         if (isSupabaseConfigured() && get().currentUser) {
-          const myId = get().currentUser!.id;
-          // Subscribe to pair channel immediately so messages flow both ways
-          subscribeToFriendChannel(myId, request.sender.id);
-          // Sync to pick up any offline messages sent before acceptance
-          await get().syncSupabaseData(myId);
+          await get().syncData(get().currentUser!.id);
         }
-      } catch (err) {
-        console.error('Handshake failed on acceptance:', err);
-        get().addToast('Gagal melakukan handshake E2EE.', 'warning');
+
+        get().addToast(`Berteman dengan @${req.sender.username}!`, 'success');
+      } catch (err: any) {
+        get().addToast(err.message || 'Gagal menerima request.', 'warning');
       }
     },
 
-    // Reject friend request
+    // ── Reject ─────────────────────────────────────────────────────────────
     rejectFriendRequest: async (requestId) => {
       try {
         if (isSupabaseConfigured()) {
-          // Delete friendship request row from server
           await supabase.from('friendships').delete().eq('id', requestId);
         }
-        set((state) => ({
-          pendingRequests: state.pendingRequests.filter(r => r.id !== requestId)
-        }));
-        get().addToast('Request pertemanan ditolak.', 'info');
-      } catch (err) {
-        console.error('Failed to reject friend request', err);
+        set(s => ({ pendingRequests: s.pendingRequests.filter(r => r.id !== requestId) }));
+      } catch (err: any) {
+        get().addToast(err.message || 'Gagal menolak request.', 'warning');
       }
     },
 
-    // Select Active Chat
+    // ── Select chat ────────────────────────────────────────────────────────
     selectActiveChat: (friendId) => {
       set({ activeFriendId: friendId });
-    },
-
-    // Send Message
-    sendMessage: async (text) => {
-      const activeId = get().activeFriendId;
-      const current = get().currentUser;
-      if (!activeId || !current || !text.trim()) return;
-
-      const messageText = text.trim();
-
-      try {
-        // Fetch derived key from IndexedDB
-        const sessionKey = await keyStore.getSessionKey(activeId);
-        if (!sessionKey) {
-          get().addToast('Gagal mengirim: Kunci enkripsi belum terbuat.', 'warning');
-          return;
-        }
-
-        // 1. Encrypt message locally using AES-256-GCM
-        const encrypted = await webCrypto.encryptMessage(messageText, sessionKey);
-        
-        const newMsg: LocalMessage = {
-          id: generateUUID(),
-          senderId: current.id,
-          recipientId: activeId,
-          text: messageText, // Saved locally in memory
-          ciphertext: encrypted.ciphertext,
-          iv: encrypted.iv,
-          timestamp: new Date().toISOString(),
-          isDelivered: false,
-          isEncrypted: true
-        };
-
-        // Update local UI immediately
-        set((state) => {
-          const currentMsgs = state.messages[activeId] || [];
-          return {
-            messages: {
-              ...state.messages,
-              [activeId]: [...currentMsgs, newMsg]
-            }
-          };
-        });
-
-        if (isSupabaseConfigured()) {
-          // 1. Insert to offline queue FIRST to get server-assigned ID
-          const { data: inserted, error: insertErr } = await supabase.from('messages').insert({
-            sender_id: current.id,
-            recipient_id: activeId,
-            ciphertext: encrypted.ciphertext,
-            iv: encrypted.iv
-          }).select('id').single();
-
-          if (insertErr) {
-            console.error('Failed to queue message:', insertErr);
-            get().addToast('Gagal mengirim pesan ke server.', 'warning');
-            return;
-          }
-
-          const serverId = inserted.id;
-
-          // Update local message with server ID so dedup guard works
-          set((state) => ({
-            messages: {
-              ...state.messages,
-              [activeId]: (state.messages[activeId] || []).map(m =>
-                m.id === newMsg.id ? { ...m, id: serverId, isDelivered: true } : m
-              )
-            }
-          }));
-
-          // 2. Broadcast on shared PAIR channel (both users are subscribed to this)
-          const pairChannelId = getPairChannelId(current.id, activeId);
-          const pairCh = pairChannels.get(pairChannelId);
-          if (pairCh) {
-            await pairCh.send({
-              type: 'broadcast',
-              event: 'new-message',
-              payload: {
-                msgId: serverId,
-                senderId: current.id,
-                ciphertext: encrypted.ciphertext,
-                iv: encrypted.iv
-              }
-            });
-          } else {
-            console.warn('Pair channel not found for', pairChannelId);
-          }
-        } else {
-          // Simulation auto-reply behavior!
-          setTimeout(() => {
-            set((state) => {
-              const msgs = state.messages[activeId] || [];
-              const updated = msgs.map(m => m.id === newMsg.id ? { ...m, isDelivered: true } : m);
-              return { messages: { ...state.messages, [activeId]: updated } };
-            });
-          }, 800);
-
-          // Simulated reply after 1.5 seconds
-          setTimeout(async () => {
-            const replies = [
-              "Ini adalah balasan otomatis terenkripsi client-side AES-256-GCM.",
-              "Sistem Zero-Knowledge mendeteksi pesan masuk dan mendekripsinya di browser saya.",
-              "Kunci sesi kita terenkripsi penuh. Server Supabase tidak tahu apa yang kita bahas.",
-              "Keren banget! Enkripsi ini super cepat karena pakai native Web Crypto API browser!"
-            ];
-            const randomReply = replies[Math.floor(Math.random() * replies.length)];
-            
-            // Encrypt reply using Bob's mock key
-            const replyEncrypted = await webCrypto.encryptMessage(randomReply, sessionKey);
-            
-            const replyMsg: LocalMessage = {
-              id: generateUUID(),
-              senderId: activeId,
-              recipientId: current.id,
-              text: randomReply,
-              ciphertext: replyEncrypted.ciphertext,
-              iv: replyEncrypted.iv,
-              timestamp: new Date().toISOString(),
-              isDelivered: true,
-              isEncrypted: true
-            };
-
-            set((state) => {
-              const currentMsgs = state.messages[activeId] || [];
-              return {
-                messages: {
-                  ...state.messages,
-                  [activeId]: [...currentMsgs, replyMsg]
-                }
-              };
-            });
-
-            get().addToast(`Pesan baru didekripsi dari @${get().friends.find(f => f.id === activeId)?.username}`, 'success');
-          }, 2000);
-        }
-      } catch (err) {
-        console.error('Send error', err);
-        get().addToast('Gagal mengenkripsi/mengirim pesan.', 'warning');
+      // Mark messages as read
+      if (isSupabaseConfigured() && get().currentUser) {
+        supabase
+          .from('messages')
+          .update({ is_read: true })
+          .eq('sender_id', friendId)
+          .eq('recipient_id', get().currentUser!.id)
+          .eq('is_read', false)
+          .then(() => {});
       }
     },
 
-    // Update Avatar — direct upload (no encryption)
-    updateAvatar: async (avatarDataUrl) => {
+    // ── Send message ───────────────────────────────────────────────────────
+    sendMessage: async (content) => {
+      const friendId = get().activeFriendId;
+      const current = get().currentUser;
+      if (!friendId || !current || !content.trim()) return;
+
+      const text = content.trim();
+
+      // Optimistic UI update
+      const tempMsg: Message = {
+        id: uid(),
+        senderId: current.id,
+        recipientId: friendId,
+        content: text,
+        isRead: false,
+        createdAt: new Date().toISOString(),
+      };
+
+      set(s => ({
+        messages: {
+          ...s.messages,
+          [friendId]: [...(s.messages[friendId] || []), tempMsg],
+        },
+      }));
+
+      try {
+        if (isSupabaseConfigured()) {
+          const { data, error } = await supabase
+            .from('messages')
+            .insert({ sender_id: current.id, recipient_id: friendId, content: text })
+            .select('id')
+            .single();
+
+          if (error) throw error;
+
+          // Replace temp ID with real server ID
+          set(s => ({
+            messages: {
+              ...s.messages,
+              [friendId]: (s.messages[friendId] || []).map(m =>
+                m.id === tempMsg.id ? { ...m, id: data.id } : m
+              ),
+            },
+          }));
+        } else {
+          // Simulation reply
+          setTimeout(() => {
+            const reply: Message = {
+              id: uid(),
+              senderId: friendId,
+              recipientId: current.id,
+              content: '👋 (simulasi balasan otomatis)',
+              isRead: true,
+              createdAt: new Date().toISOString(),
+            };
+            set(s => ({
+              messages: { ...s.messages, [friendId]: [...(s.messages[friendId] || []), reply] },
+            }));
+          }, 1000);
+        }
+      } catch (err: any) {
+        // Remove optimistic message on failure
+        set(s => ({
+          messages: {
+            ...s.messages,
+            [friendId]: (s.messages[friendId] || []).filter(m => m.id !== tempMsg.id),
+          },
+        }));
+        get().addToast('Gagal mengirim pesan.', 'warning');
+      }
+    },
+
+    // ── Avatar upload ──────────────────────────────────────────────────────
+    updateAvatar: async (dataUrl) => {
       const current = get().currentUser;
       if (!current) return;
 
-      get().addToast('Mengupload foto profil...', 'info');
+      set(s => ({ currentUser: { ...s.currentUser!, avatarUrl: dataUrl } }));
+      localStorage.setItem('womp-user', JSON.stringify({ ...current, avatarUrl: dataUrl }));
+
+      if (!isSupabaseConfigured()) return;
 
       try {
-        // Update local state immediately for snappy UX
-        set((state) => ({
-          currentUser: { ...state.currentUser!, avatarUrl: avatarDataUrl }
-        }));
-        localStorage.setItem('womp-current-user', JSON.stringify({
-          ...current,
-          avatarUrl: avatarDataUrl
-        }));
+        get().addToast('Mengupload foto...', 'info');
 
-        if (isSupabaseConfigured()) {
-          // Convert base64 dataUrl to Blob
-          const base64Data = avatarDataUrl.split(',')[1];
-          const byteString = atob(base64Data);
-          const mimeMatch = avatarDataUrl.match(/data:([^;]+);/);
-          const mimeType = mimeMatch ? mimeMatch[1] : 'image/jpeg';
-          const byteArray = new Uint8Array(byteString.length);
-          for (let i = 0; i < byteString.length; i++) {
-            byteArray[i] = byteString.charCodeAt(i);
-          }
-          const blob = new Blob([byteArray], { type: mimeType });
-          const ext = mimeType.split('/')[1] || 'jpg';
-          const fileName = `${current.id}.${ext}`;
+        const base64 = dataUrl.split(',')[1];
+        const mime = dataUrl.match(/data:([^;]+)/)?.[1] || 'image/jpeg';
+        const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+        const blob = new Blob([bytes], { type: mime });
+        const ext = mime.split('/')[1] || 'jpg';
+        const fileName = `${current.id}.${ext}`;
 
-          const { error: uploadErr } = await supabase.storage
-            .from('avatars')
-            .upload(fileName, blob, { upsert: true, contentType: mimeType });
+        const { error: uploadErr } = await supabase.storage
+          .from('avatars')
+          .upload(fileName, blob, { upsert: true, contentType: mime });
 
-          if (uploadErr) throw uploadErr;
+        if (uploadErr) throw uploadErr;
 
-          const { data: publicUrlData } = supabase.storage
-            .from('avatars')
-            .getPublicUrl(fileName);
+        const { data: urlData } = supabase.storage.from('avatars').getPublicUrl(fileName);
 
-          const { error: profileUpdateErr } = await supabase
-            .from('profiles')
-            .update({ profile_avatar_url: publicUrlData.publicUrl })
-            .eq('id', current.id);
+        await supabase
+          .from('profiles')
+          .update({ avatar_url: urlData.publicUrl })
+          .eq('id', current.id);
 
-          if (profileUpdateErr) throw profileUpdateErr;
-        }
-
-        get().addToast('Foto profil berhasil diupload!', 'success');
-      } catch (err) {
-        console.error(err);
-        get().addToast('Gagal upload foto profil.', 'warning');
+        set(s => ({ currentUser: { ...s.currentUser!, avatarUrl: urlData.publicUrl } }));
+        localStorage.setItem('womp-user', JSON.stringify({ ...current, avatarUrl: urlData.publicUrl }));
+        get().addToast('Foto profil diperbarui!', 'success');
+      } catch (err: any) {
+        get().addToast('Gagal upload foto.', 'warning');
       }
     },
 
-    // Sync Database (Fetch accepted friends, pending requests, and offline messages queue)
-    syncSupabaseData: async (userId) => {
+    // ── Sync data ──────────────────────────────────────────────────────────
+    syncData: async (userId) => {
       if (!isSupabaseConfigured()) return;
-      
+
       try {
-        // 1. Fetch user's profile to make sure they exist on the server
-        const { data: myProfile, error: profileErr } = await supabase
-          .from('profiles')
-          .select('*')
-          .eq('id', userId)
-          .maybeSingle();
-        
-        if (profileErr || !myProfile) {
-          console.warn('Profile not found on Supabase server', profileErr);
-          return;
-        }
-
-        // Update local state with latest avatar URL if any
-        if (myProfile.profile_avatar_url) {
-          set((state) => ({
-            currentUser: state.currentUser ? {
-              ...state.currentUser,
-              avatarUrl: myProfile.profile_avatar_url
-            } : state.currentUser
-          }));
-        }
-
-        // 2. Fetch accepted friendships (where I am either requester or addressee)
-        const { data: activeFriendships, error: friendsErr } = await supabase
+        // 1. Load accepted friends
+        const { data: friendships } = await supabase
           .from('friendships')
-          .select('*')
+          .select('id, requester_id, addressee_id, status')
           .or(`requester_id.eq.${userId},addressee_id.eq.${userId}`)
           .eq('status', 'accepted');
 
-        if (!friendsErr && activeFriendships) {
-          const loadedFriends: UserProfile[] = [];
-          const myPrivKey = await keyStore.getMyKey('identity-private') as CryptoKey;
+        if (friendships) {
+          const partnerIds = friendships.map(f =>
+            f.requester_id === userId ? f.addressee_id : f.requester_id
+          );
 
-          for (const f of activeFriendships) {
-            const partnerId = f.requester_id === userId ? f.addressee_id : f.requester_id;
-            
-            // Get partner's profile details
-            const { data: partnerProfile, error: partnerErr } = await supabase
+          if (partnerIds.length > 0) {
+            const { data: profiles } = await supabase
               .from('profiles')
-              .select('*')
-              .eq('id', partnerId)
-              .maybeSingle();
+              .select('id, username, avatar_url')
+              .in('id', partnerIds);
 
-            if (!partnerErr && partnerProfile) {
-              const pubKeyBase64 = partnerProfile.public_identity_key; // Direct string!
-              
-              // Load derived session key from IndexedDB, if not derived yet, do it!
-              let sessionKey = await keyStore.getSessionKey(partnerId);
-              if (!sessionKey && myPrivKey) {
-                try {
-                  const partnerPubKeyObj = await webCrypto.importPublicKey(pubKeyBase64);
-                  const derived = await webCrypto.deriveSharedSessionKey(myPrivKey, partnerPubKeyObj);
-                  await keyStore.saveSessionKey(partnerId, derived);
-                  sessionKey = derived;
-                } catch (handshakeErr) {
-                  console.error('Failed to auto-derive E2EE handshake key', handshakeErr);
-                }
-              }
-
-              loadedFriends.push({
-                id: partnerId,
-                username: partnerProfile.username,
-                publicIdentityKey: pubKeyBase64,
-                avatarUrl: partnerProfile.profile_avatar_url,
-                isOnline: true // Active
-              });
-            }
-          }
-          set({ friends: loadedFriends });
-
-          // Subscribe to pair channel for each friend (idempotent)
-          const currentUserId = get().currentUser?.id;
-          if (currentUserId) {
-            loadedFriends.forEach(f => subscribeToFriendChannel(currentUserId, f.id));
+            const friends: UserProfile[] = (profiles || []).map(p => ({
+              id: p.id,
+              username: p.username,
+              avatarUrl: p.avatar_url,
+            }));
+            set({ friends });
+          } else {
+            set({ friends: [] });
           }
         }
 
-        // 3. Fetch pending incoming friend requests
-        const { data: pendingReqs, error: reqsErr } = await supabase
+        // 2. Pending requests
+        const { data: pending } = await supabase
           .from('friendships')
-          .select('*')
+          .select('id, requester_id')
           .eq('addressee_id', userId)
           .eq('status', 'pending');
 
-        if (!reqsErr && pendingReqs) {
-          const loadedRequests: FriendRequest[] = [];
-          for (const r of pendingReqs) {
-            const { data: senderProfile, error: senderErr } = await supabase
-              .from('profiles')
-              .select('*')
-              .eq('id', r.requester_id)
-              .maybeSingle();
+        if (pending && pending.length > 0) {
+          const senderIds = pending.map(p => p.requester_id);
+          const { data: senderProfiles } = await supabase
+            .from('profiles')
+            .select('id, username, avatar_url')
+            .in('id', senderIds);
 
-            if (!senderErr && senderProfile) {
-              loadedRequests.push({
-                id: r.id,
-                sender: {
-                  id: senderProfile.id,
-                  username: senderProfile.username,
-                  publicIdentityKey: senderProfile.public_identity_key // Direct string!
-                }
-              });
-            }
-          }
-          set({ pendingRequests: loadedRequests });
+          const requests: FriendRequest[] = pending.map(p => {
+            const profile = (senderProfiles || []).find(sp => sp.id === p.requester_id);
+            return {
+              id: p.id,
+              sender: { id: p.requester_id, username: profile?.username || 'unknown', avatarUrl: profile?.avatar_url },
+            };
+          });
+          set({ pendingRequests: requests });
+        } else {
+          set({ pendingRequests: [] });
         }
 
-        // 4. Consume offline messages queue
-        const { data: offlineMsgs, error: msgsErr } = await supabase
+        // 3. Load unread messages (offline queue)
+        const { data: unread } = await supabase
           .from('messages')
           .select('*')
           .eq('recipient_id', userId)
-          .eq('is_delivered', false);
+          .eq('is_read', false)
+          .order('created_at', { ascending: true });
 
-        if (!msgsErr && offlineMsgs && offlineMsgs.length > 0) {
-          const newMsgsMap: { [friendId: string]: LocalMessage[] } = { ...get().messages };
-
-          for (const m of offlineMsgs) {
-            const senderId = m.sender_id;
-            const sessionKey = await keyStore.getSessionKey(senderId);
-            
-            if (sessionKey) {
-              try {
-                // Decrypt directly from String!
-                const decryptedText = await webCrypto.decryptMessage({ 
-                  ciphertext: m.ciphertext, 
-                  iv: m.iv 
-                }, sessionKey);
-                
-                const localMsg: LocalMessage = {
-                  id: m.id,
-                  senderId,
-                  recipientId: userId,
-                  text: decryptedText,
-                  ciphertext: m.ciphertext,
-                  iv: m.iv,
-                  timestamp: m.timestamp || new Date().toISOString(),
-                  isDelivered: true,
-                  isEncrypted: true
-                };
-
-                if (!newMsgsMap[senderId]) {
-                  newMsgsMap[senderId] = [];
-                }
-                // Avoid duplicate appends
-                if (!newMsgsMap[senderId].some(existing => existing.id === m.id)) {
-                  newMsgsMap[senderId].push(localMsg);
-                }
-              } catch (decErr) {
-                console.error('Failed to decrypt offline message', decErr);
-              }
+        if (unread && unread.length > 0) {
+          const newMsgs: Record<string, Message[]> = { ...get().messages };
+          for (const row of unread) {
+            const msg: Message = {
+              id: row.id,
+              senderId: row.sender_id,
+              recipientId: row.recipient_id,
+              content: row.content,
+              isRead: row.is_read,
+              createdAt: row.created_at,
+            };
+            if (!newMsgs[msg.senderId]) newMsgs[msg.senderId] = [];
+            if (!newMsgs[msg.senderId].some(m => m.id === msg.id)) {
+              newMsgs[msg.senderId].push(msg);
             }
           }
-          set({ messages: newMsgsMap });
-
-          // Mark consumed offline messages as delivered in Supabase
-          const msgIds = offlineMsgs.map(m => m.id);
-          await supabase
-            .from('messages')
-            .update({ is_delivered: true })
-            .in('id', msgIds);
+          set({ messages: newMsgs });
         }
-
-      } catch (syncErr) {
-        console.error('Failed to sync Supabase data', syncErr);
+      } catch (err) {
+        console.error('syncData error:', err);
       }
-    }
+    },
   };
 });
