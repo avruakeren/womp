@@ -138,15 +138,9 @@ export const useChatStore = create<ChatStore>((set, get) => {
         
         if (sessionKey) {
           try {
-            // Hex/Binary array from PG bytea converted to base64
-            const ciphertextBytes = new Uint8Array(ciphertext);
-            const ivBytes = new Uint8Array(iv);
-            
-            const ciphertextBase64 = webCrypto.arrayBufferToBase64(ciphertextBytes.buffer);
-            const ivBase64 = webCrypto.arrayBufferToBase64(ivBytes.buffer);
-            
+            // Decrypt directly from String!
             const decryptedText = await webCrypto.decryptMessage(
-              { ciphertext: ciphertextBase64, iv: ivBase64 }, 
+              { ciphertext, iv }, 
               sessionKey
             );
 
@@ -155,8 +149,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
               senderId: sender_id,
               recipientId: userId,
               text: decryptedText,
-              ciphertext: ciphertextBase64,
-              iv: ivBase64,
+              ciphertext,
+              iv,
               timestamp: timestamp || new Date().toISOString(),
               isDelivered: true,
               isEncrypted: true
@@ -313,11 +307,11 @@ export const useChatStore = create<ChatStore>((set, get) => {
             throw new Error('Username sudah terpakai. Silakan pilih username lain.');
           }
 
-          // Supabase signup
+          // Supabase signup (Direct base64 string storage!)
           const { error } = await supabase.from('profiles').insert({
             id: newUserId,
             username: username.toLowerCase(),
-            public_identity_key: Array.from(new Uint8Array(webCrypto.base64ToArrayBuffer(publicIdentityKeyBase64))),
+            public_identity_key: publicIdentityKeyBase64,
           });
           if (error) throw error;
         }
@@ -389,12 +383,12 @@ export const useChatStore = create<ChatStore>((set, get) => {
             const profileKey = await webCrypto.generateProfileKey();
             await keyStore.saveMyKey('profile-key', profileKey);
 
-            // Export and update on Supabase
+            // Export and update on Supabase (Direct Base64 String!)
             const publicIdentityKeyBase64 = await webCrypto.exportPublicKey(identityKeys.publicKey);
             const { error: updateErr } = await supabase
               .from('profiles')
               .update({
-                public_identity_key: Array.from(new Uint8Array(webCrypto.base64ToArrayBuffer(publicIdentityKeyBase64)))
+                public_identity_key: publicIdentityKeyBase64
               })
               .eq('id', targetUserId);
 
@@ -577,7 +571,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
           
           if (updateErr) throw updateErr;
           
-          // Download friend's public key
+          // Download friend's public key (Clean base64!)
           const friendPubKeyObj = await webCrypto.importPublicKey(request.sender.publicIdentityKey!);
           
           // Derive shared key
@@ -601,8 +595,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
           await get().syncSupabaseData(get().currentUser!.id);
         }
       } catch (err) {
-        console.error(err);
-        get().addToast('Gagal menyetujui request.', 'warning');
+        console.error('Handshake failed on acceptance:', err);
+        get().addToast('Gagal melakukan handshake E2EE.', 'warning');
       }
     },
 
@@ -681,12 +675,12 @@ export const useChatStore = create<ChatStore>((set, get) => {
             }
           });
 
-          // 3. Queue to offline message database in case they are offline
+          // 3. Queue to offline message database in case they are offline (Direct Base64 Strings!)
           await supabase.from('messages').insert({
             sender_id: current.id,
             recipient_id: activeId,
-            ciphertext: Array.from(new Uint8Array(webCrypto.base64ToArrayBuffer(encrypted.ciphertext))),
-            iv: Array.from(new Uint8Array(webCrypto.base64ToArrayBuffer(encrypted.iv)))
+            ciphertext: encrypted.ciphertext,
+            iv: encrypted.iv
           });
         } else {
           // Simulation auto-reply behavior!
@@ -857,9 +851,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
               .maybeSingle();
 
             if (!partnerErr && partnerProfile) {
-              // Convert bytea Array back to Base64 public key
-              const pubKeyBytes = new Uint8Array(partnerProfile.public_identity_key);
-              const pubKeyBase64 = webCrypto.arrayBufferToBase64(pubKeyBytes.buffer);
+              const pubKeyBase64 = partnerProfile.public_identity_key; // Direct string!
               
               // Load derived session key from IndexedDB, if not derived yet, do it!
               let sessionKey = await keyStore.getSessionKey(partnerId);
@@ -903,13 +895,12 @@ export const useChatStore = create<ChatStore>((set, get) => {
               .maybeSingle();
 
             if (!senderErr && senderProfile) {
-              const pubKeyBytes = new Uint8Array(senderProfile.public_identity_key);
               loadedRequests.push({
                 id: r.id,
                 sender: {
                   id: senderProfile.id,
                   username: senderProfile.username,
-                  publicIdentityKey: webCrypto.arrayBufferToBase64(pubKeyBytes.buffer)
+                  publicIdentityKey: senderProfile.public_identity_key // Direct string!
                 }
               });
             }
@@ -933,22 +924,19 @@ export const useChatStore = create<ChatStore>((set, get) => {
             
             if (sessionKey) {
               try {
-                const ciphertextBytes = new Uint8Array(m.ciphertext);
-                const ivBytes = new Uint8Array(m.iv);
-
-                const ciphertextBase64 = webCrypto.arrayBufferToBase64(ciphertextBytes.buffer);
-                const ivBase64 = webCrypto.arrayBufferToBase64(ivBytes.buffer);
-                
-                // Decrypt message client-side
-                const decryptedText = await webCrypto.decryptMessage({ ciphertext: ciphertextBase64, iv: ivBase64 }, sessionKey);
+                // Decrypt directly from String!
+                const decryptedText = await webCrypto.decryptMessage({ 
+                  ciphertext: m.ciphertext, 
+                  iv: m.iv 
+                }, sessionKey);
                 
                 const localMsg: LocalMessage = {
                   id: m.id,
                   senderId,
                   recipientId: userId,
                   text: decryptedText,
-                  ciphertext: ciphertextBase64,
-                  iv: ivBase64,
+                  ciphertext: m.ciphertext,
+                  iv: m.iv,
                   timestamp: m.timestamp || new Date().toISOString(),
                   isDelivered: true,
                   isEncrypted: true
