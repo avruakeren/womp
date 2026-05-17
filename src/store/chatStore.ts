@@ -56,6 +56,7 @@ interface ChatStore {
   sendMessage: (content: string) => Promise<void>;
   selectActiveChat: (friendId: string) => void;
   updateAvatar: (dataUrl: string) => Promise<void>;
+  updateUsername: (newUsername: string) => Promise<boolean>;
 
   syncData: (userId: string) => Promise<void>;
 }
@@ -480,6 +481,40 @@ export const useChatStore = create<ChatStore>((set, get) => {
         get().addToast('Foto profil diperbarui!', 'success');
       } catch (err: any) {
         get().addToast('Gagal upload foto.', 'warning');
+      }
+    },
+
+    updateUsername: async (newUsername: string) => {
+      const current = get().currentUser;
+      if (!current || !newUsername.trim()) return false;
+      const clean = newUsername.trim().toLowerCase();
+      if (clean === current.username) return true;
+
+      try {
+        if (isSupabaseConfigured()) {
+          const { error } = await supabase
+            .from('profiles')
+            .update({ username: clean })
+            .eq('id', current.id);
+
+          if (error) {
+            if (error.code === '23505') { // Unique violation
+              get().addToast('Username sudah dipakai orang lain!', 'warning');
+            } else {
+              get().addToast('Gagal update username.', 'warning');
+            }
+            return false;
+          }
+        }
+
+        const updatedUser = { ...current, username: clean };
+        set({ currentUser: updatedUser });
+        localStorage.setItem('womp-user', JSON.stringify(updatedUser));
+        get().addToast('Username berhasil diganti!', 'success');
+        return true;
+      } catch (err) {
+        get().addToast('Error saat mengganti username', 'warning');
+        return false;
       }
     },
 

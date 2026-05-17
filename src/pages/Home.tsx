@@ -11,7 +11,7 @@ export default function Home() {
     currentUser, isAuthenticated, friends, pendingRequests,
     activeFriendId, messages, logoutUser, sendFriendRequest,
     acceptFriendRequest, rejectFriendRequest, sendMessage,
-    selectActiveChat, updateAvatar
+    selectActiveChat, updateAvatar, updateUsername
   } = useChatStore();
   
   const navigate = useNavigate();
@@ -31,7 +31,23 @@ export default function Home() {
 
   // Modals state
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [newUsernameInput, setNewUsernameInput] = useState('');
+  const [isUpdatingUsername, setIsUpdatingUsername] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Set the username input when modal opens
+  useEffect(() => {
+    if (isSettingsOpen && currentUser) {
+      setNewUsernameInput(currentUser.username);
+    }
+  }, [isSettingsOpen, currentUser]);
+
+  const handleUpdateUsername = async () => {
+    if (newUsernameInput.trim() === currentUser?.username || !newUsernameInput.trim()) return;
+    setIsUpdatingUsername(true);
+    await updateUsername(newUsernameInput);
+    setIsUpdatingUsername(false);
+  };
 
   // Auto-scroll ref
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -408,14 +424,27 @@ export default function Home() {
             </div>
 
             <div className="form-group">
-              <label className="form-label">Badge Akun Kamu</label>
-              <input
-                type="text"
-                className="form-input"
-                value={`@${currentUser?.username}`}
-                disabled
-                style={{ background: 'rgba(0,0,0,0.2)', color: 'var(--text-secondary)' }}
-              />
+              <label className="form-label">Badge Akun Kamu (Username)</label>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <div className="input-wrapper" style={{ flex: 1 }}>
+                  <span className="input-icon">@</span>
+                  <input
+                    type="text"
+                    className="form-input"
+                    value={newUsernameInput}
+                    onChange={(e) => setNewUsernameInput(e.target.value)}
+                    disabled={isUpdatingUsername}
+                  />
+                </div>
+                <button 
+                  className="btn btn-primary btn-xs" 
+                  onClick={handleUpdateUsername}
+                  disabled={isUpdatingUsername || newUsernameInput === currentUser?.username}
+                  style={{ padding: '0 16px', borderRadius: '8px' }}
+                >
+                  {isUpdatingUsername ? '...' : 'Simpan'}
+                </button>
+              </div>
             </div>
 
             <button
