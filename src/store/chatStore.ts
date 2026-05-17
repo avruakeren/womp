@@ -75,20 +75,47 @@ const generateUUID = () => crypto.randomUUID();
 
 export const useChatStore = create<ChatStore>((set, get) => {
   
-  // Connect to Supabase Realtime if live mode
-  let realtimeChannel: any = null;
+  // Channel registry: track all subscribed pair channels
+  let friendshipChannel: any = null;
+  const pairChannels: Map<string, any> = new Map();
 
-  const setupSupabaseRealtime = (userId: string) => {
+  // Deterministic shared channel ID for any two users
+  const getPairChannelId = (userA: string, userB: string) =>
+    `womp:pair:${[userA, userB].sort().join('_')}`;
+
+  // Subscribe to friendship-level realtime (friend requests only)
+  const setupFriendshipChannel = (userId: string) => {
     if (!isSupabaseConfigured()) return;
+    if (friendshipChannel) return; // Already subscribed
 
-    // Listen on user's direct E2EE broadcast channel only.
-    // postgres_changes INSERT is intentionally REMOVED to prevent double messages.
-    // Offline messages are consumed exclusively in syncSupabaseData() on login.
-    realtimeChannel = supabase.channel(`womp:${userId}`)
-      // Real-time chat via WebSocket Broadcast
+    friendshipChannel = supabase
+      .channel(`womp:meta:${userId}`)
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'friendships'
+      }, async () => {
+        await get().syncSupabaseData(userId);
+      })
+      .subscribe((status) => {
+        set({ isWsConnected: status === 'SUBSCRIBED' });
+      });
+  };
+
+  // Subscribe to a shared pair channel with a specific friend
+  const subscribeToFriendChannel = (myId: string, friendId: string) => {
+    if (!isSupabaseConfigured()) return;
+    const channelId = getPairChannelId(myId, friendId);
+    if (pairChannels.has(channelId)) return; // Already subscribed
+
+    const ch = supabase
+      .channel(channelId)
       .on('broadcast', { event: 'new-message' }, async (payload) => {
         const { senderId, ciphertext, iv, msgId } = payload.payload;
-        
+
+        // Ignore messages sent by self (we already show them locally)
+        if (senderId === myId) return;
+
         const sessionKey = await keyStore.getSessionKey(senderId);
         if (!sessionKey) {
           get().addToast('Pesan masuk, tapi kunci handshake belum ada.', 'warning');
@@ -97,11 +124,10 @@ export const useChatStore = create<ChatStore>((set, get) => {
 
         try {
           const decryptedText = await webCrypto.decryptMessage({ ciphertext, iv }, sessionKey);
-          
           const newMsg: LocalMessage = {
-            id: msgId || generateUUID(), // Use server ID to prevent duplicates
+            id: msgId || generateUUID(),
             senderId,
-            recipientId: userId,
+            recipientId: myId,
             text: decryptedText,
             ciphertext,
             iv,
@@ -111,32 +137,20 @@ export const useChatStore = create<ChatStore>((set, get) => {
           };
 
           set((state) => {
-            const currentMsgs = state.messages[senderId] || [];
-            // Guard: never add same message ID twice
-            if (currentMsgs.some(m => m.id === newMsg.id)) return state;
+            const current = state.messages[senderId] || [];
+            if (current.some(m => m.id === newMsg.id)) return state;
             return {
-              messages: {
-                ...state.messages,
-                [senderId]: [...currentMsgs, newMsg]
-              }
+              messages: { ...state.messages, [senderId]: [...current, newMsg] }
             };
           });
         } catch (err) {
           console.error('Decryption failed:', err);
-          get().addToast('Gagal mendekripsi pesan masuk.', 'warning');
+          get().addToast('Gagal mendekripsi pesan.', 'warning');
         }
       })
-      // Friendships updates (accept/reject real-time)
-      .on('postgres_changes', { 
-        event: '*', 
-        schema: 'public', 
-        table: 'friendships' 
-      }, async () => {
-        await get().syncSupabaseData(userId);
-      })
-      .subscribe((status) => {
-        set({ isWsConnected: status === 'SUBSCRIBED' });
-      });
+      .subscribe();
+
+    pairChannels.set(channelId, ch);
   };
 
   return {
@@ -178,7 +192,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
             get().addToast(`Sesi dipulihkan. Kunci E2EE dimuat dari IndexedDB!`, 'success');
             
             if (isSupabaseConfigured()) {
-              setupSupabaseRealtime(parsedUser.id);
+              setupFriendshipChannel(parsedUser.id);
               await get().syncSupabaseData(parsedUser.id);
             } else {
               // Load mock simulation data
@@ -645,17 +659,23 @@ export const useChatStore = create<ChatStore>((set, get) => {
             }
           }));
 
-          // 2. Broadcast via WebSockets with the SAME server ID
-          await supabase.channel(`womp:${activeId}`).send({
-            type: 'broadcast',
-            event: 'new-message',
-            payload: {
-              msgId: serverId,
-              senderId: current.id,
-              ciphertext: encrypted.ciphertext,
-              iv: encrypted.iv
-            }
-          });
+          // 2. Broadcast on shared PAIR channel (both users are subscribed to this)
+          const pairChannelId = getPairChannelId(current.id, activeId);
+          const pairCh = pairChannels.get(pairChannelId);
+          if (pairCh) {
+            await pairCh.send({
+              type: 'broadcast',
+              event: 'new-message',
+              payload: {
+                msgId: serverId,
+                senderId: current.id,
+                ciphertext: encrypted.ciphertext,
+                iv: encrypted.iv
+              }
+            });
+          } else {
+            console.warn('Pair channel not found for', pairChannelId);
+          }
         } else {
           // Simulation auto-reply behavior!
           setTimeout(() => {
@@ -710,69 +730,59 @@ export const useChatStore = create<ChatStore>((set, get) => {
       }
     },
 
-    // Update Avatar (E2EE profile picture setting)
+    // Update Avatar — direct upload (no encryption)
     updateAvatar: async (avatarDataUrl) => {
       const current = get().currentUser;
       if (!current) return;
 
-      get().addToast('Mengompresi & mengenkripsi avatar...', 'info');
+      get().addToast('Mengupload foto profil...', 'info');
 
       try {
-        // Fetch user's Profile AES key
-        let profileKey = await keyStore.getMyKey('profile-key') as CryptoKey;
-        if (!profileKey) {
-          profileKey = await webCrypto.generateProfileKey();
-          await keyStore.saveMyKey('profile-key', profileKey);
-        }
-
-        // Convert base64 dataUrl of cropped image to binary buffer
-        const base64Data = avatarDataUrl.split(',')[1];
-        const binaryBuffer = webCrypto.base64ToArrayBuffer(base64Data);
-
-        // Encrypt profile picture using the profile key
-        const encrypted = await webCrypto.encryptBinary(binaryBuffer, profileKey);
-        
-        // In local state, we just save the clean dataUrl for immediate view
+        // Update local state immediately for snappy UX
         set((state) => ({
-          currentUser: {
-            ...state.currentUser!,
-            avatarUrl: avatarDataUrl
-          }
+          currentUser: { ...state.currentUser!, avatarUrl: avatarDataUrl }
         }));
-
         localStorage.setItem('womp-current-user', JSON.stringify({
           ...current,
           avatarUrl: avatarDataUrl
         }));
 
         if (isSupabaseConfigured()) {
-          // Upload encrypted blob to Supabase Storage
-          const fileName = `${current.id}-avatar.enc`;
-          
-          // Convert Base64 ciphertext back to blob for S3 upload
-          const encryptedBytes = webCrypto.base64ToArrayBuffer(encrypted.ciphertext);
-          const blob = new Blob([encryptedBytes], { type: 'application/octet-stream' });
+          // Convert base64 dataUrl to Blob
+          const base64Data = avatarDataUrl.split(',')[1];
+          const byteString = atob(base64Data);
+          const mimeMatch = avatarDataUrl.match(/data:([^;]+);/);
+          const mimeType = mimeMatch ? mimeMatch[1] : 'image/jpeg';
+          const byteArray = new Uint8Array(byteString.length);
+          for (let i = 0; i < byteString.length; i++) {
+            byteArray[i] = byteString.charCodeAt(i);
+          }
+          const blob = new Blob([byteArray], { type: mimeType });
+          const ext = mimeType.split('/')[1] || 'jpg';
+          const fileName = `${current.id}.${ext}`;
 
-          const { data: _uploadData, error: uploadErr } = await supabase.storage
+          const { error: uploadErr } = await supabase.storage
             .from('avatars')
-            .upload(fileName, blob, { upsert: true });
+            .upload(fileName, blob, { upsert: true, contentType: mimeType });
 
           if (uploadErr) throw uploadErr;
 
-          // Save public URL
-          const { data: publicUrlData } = supabase.storage.from('avatars').getPublicUrl(fileName);
-          
-          const { error: profileUpdateErr } = await supabase.from('profiles').update({
-            profile_avatar_url: publicUrlData.publicUrl
-          }).eq('id', current.id);
+          const { data: publicUrlData } = supabase.storage
+            .from('avatars')
+            .getPublicUrl(fileName);
+
+          const { error: profileUpdateErr } = await supabase
+            .from('profiles')
+            .update({ profile_avatar_url: publicUrlData.publicUrl })
+            .eq('id', current.id);
 
           if (profileUpdateErr) throw profileUpdateErr;
         }
 
-        get().addToast('Avatar berhasil dikompresi, dienkripsi penuh (AES-GCM), dan disimpan!', 'success');
+        get().addToast('Foto profil berhasil diupload!', 'success');
       } catch (err) {
         console.error(err);
-        get().addToast('Gagal memperbarui avatar terenkripsi.', 'warning');
+        get().addToast('Gagal upload foto profil.', 'warning');
       }
     },
 
@@ -850,6 +860,12 @@ export const useChatStore = create<ChatStore>((set, get) => {
             }
           }
           set({ friends: loadedFriends });
+
+          // Subscribe to pair channel for each friend (idempotent)
+          const currentUserId = get().currentUser?.id;
+          if (currentUserId) {
+            loadedFriends.forEach(f => subscribeToFriendChannel(currentUserId, f.id));
+          }
         }
 
         // 3. Fetch pending incoming friend requests
