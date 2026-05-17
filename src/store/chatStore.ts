@@ -561,7 +561,11 @@ export const useChatStore = create<ChatStore>((set, get) => {
         get().addToast(`Handshake E2EE selesai. Sekarang terhubung dengan @${request.sender.username}!`, 'success');
         
         if (isSupabaseConfigured() && get().currentUser) {
-          await get().syncSupabaseData(get().currentUser!.id);
+          const myId = get().currentUser!.id;
+          // Subscribe to pair channel immediately so messages flow both ways
+          subscribeToFriendChannel(myId, request.sender.id);
+          // Sync to pick up any offline messages sent before acceptance
+          await get().syncSupabaseData(myId);
         }
       } catch (err) {
         console.error('Handshake failed on acceptance:', err);
