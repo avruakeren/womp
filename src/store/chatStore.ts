@@ -81,25 +81,25 @@ export const useChatStore = create<ChatStore>((set, get) => {
   const setupSupabaseRealtime = (userId: string) => {
     if (!isSupabaseConfigured()) return;
 
-    // Listen on user's direct E2EE broadcast channel and postgres updates
+    // Listen on user's direct E2EE broadcast channel only.
+    // postgres_changes INSERT is intentionally REMOVED to prevent double messages.
+    // Offline messages are consumed exclusively in syncSupabaseData() on login.
     realtimeChannel = supabase.channel(`womp:${userId}`)
-      // 1. WebSocket Broadcast (Fast real-time chat)
+      // Real-time chat via WebSocket Broadcast
       .on('broadcast', { event: 'new-message' }, async (payload) => {
-        const { senderId, ciphertext, iv } = payload.payload;
+        const { senderId, ciphertext, iv, msgId } = payload.payload;
         
-        // Fetch derived key from IndexedDB
         const sessionKey = await keyStore.getSessionKey(senderId);
         if (!sessionKey) {
-          get().addToast('Pesan terenkripsi masuk, tapi kunci handshake belum dibuat.', 'warning');
+          get().addToast('Pesan masuk, tapi kunci handshake belum ada.', 'warning');
           return;
         }
 
         try {
-          // Decrypt client-side using Web Crypto
           const decryptedText = await webCrypto.decryptMessage({ ciphertext, iv }, sessionKey);
           
           const newMsg: LocalMessage = {
-            id: generateUUID(),
+            id: msgId || generateUUID(), // Use server ID to prevent duplicates
             senderId,
             recipientId: userId,
             text: decryptedText,
@@ -112,6 +112,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
 
           set((state) => {
             const currentMsgs = state.messages[senderId] || [];
+            // Guard: never add same message ID twice
+            if (currentMsgs.some(m => m.id === newMsg.id)) return state;
             return {
               messages: {
                 ...state.messages,
@@ -119,62 +121,12 @@ export const useChatStore = create<ChatStore>((set, get) => {
               }
             };
           });
-
-          get().addToast(`Pesan terenkripsi berhasil didekripsi dari @${get().friends.find((f: UserProfile) => f.id === senderId)?.username || 'user'}`, 'success');
         } catch (err) {
           console.error('Decryption failed:', err);
           get().addToast('Gagal mendekripsi pesan masuk.', 'warning');
         }
       })
-      // 2. Listen to Database Offline Messages Queue Insertions
-      .on('postgres_changes', { 
-        event: 'INSERT', 
-        schema: 'public', 
-        table: 'messages', 
-        filter: `recipient_id=eq.${userId}` 
-      }, async (payload) => {
-        const { id, sender_id, ciphertext, iv, timestamp } = payload.new;
-        const sessionKey = await keyStore.getSessionKey(sender_id);
-        
-        if (sessionKey) {
-          try {
-            // Decrypt directly from String!
-            const decryptedText = await webCrypto.decryptMessage(
-              { ciphertext, iv }, 
-              sessionKey
-            );
-
-            const newMsg: LocalMessage = {
-              id,
-              senderId: sender_id,
-              recipientId: userId,
-              text: decryptedText,
-              ciphertext,
-              iv,
-              timestamp: timestamp || new Date().toISOString(),
-              isDelivered: true,
-              isEncrypted: true
-            };
-
-            set((state) => {
-              const currentMsgs = state.messages[sender_id] || [];
-              if (currentMsgs.some(m => m.id === id)) return state; // Avoid duplicate renders
-              return {
-                messages: {
-                  ...state.messages,
-                  [sender_id]: [...currentMsgs, newMsg]
-                }
-              };
-            });
-
-            // Mark message as consumed (delivered) in server queue
-            await supabase.from('messages').update({ is_delivered: true }).eq('id', id);
-          } catch (decErr) {
-            console.error('Failed to decrypt inline offline message', decErr);
-          }
-        }
-      })
-      // 3. Listen to Friendships updates in real-time
+      // Friendships updates (accept/reject real-time)
       .on('postgres_changes', { 
         event: '*', 
         schema: 'public', 
@@ -667,23 +619,42 @@ export const useChatStore = create<ChatStore>((set, get) => {
         });
 
         if (isSupabaseConfigured()) {
-          // 2. Broadcast via WebSockets
-          await supabase.channel(`womp:${activeId}`).send({
-            type: 'broadcast',
-            event: 'new-message',
-            payload: {
-              senderId: current.id,
-              ciphertext: encrypted.ciphertext,
-              iv: encrypted.iv
-            }
-          });
-
-          // 3. Queue to offline message database in case they are offline (Direct Base64 Strings!)
-          await supabase.from('messages').insert({
+          // 1. Insert to offline queue FIRST to get server-assigned ID
+          const { data: inserted, error: insertErr } = await supabase.from('messages').insert({
             sender_id: current.id,
             recipient_id: activeId,
             ciphertext: encrypted.ciphertext,
             iv: encrypted.iv
+          }).select('id').single();
+
+          if (insertErr) {
+            console.error('Failed to queue message:', insertErr);
+            get().addToast('Gagal mengirim pesan ke server.', 'warning');
+            return;
+          }
+
+          const serverId = inserted.id;
+
+          // Update local message with server ID so dedup guard works
+          set((state) => ({
+            messages: {
+              ...state.messages,
+              [activeId]: (state.messages[activeId] || []).map(m =>
+                m.id === newMsg.id ? { ...m, id: serverId, isDelivered: true } : m
+              )
+            }
+          }));
+
+          // 2. Broadcast via WebSockets with the SAME server ID
+          await supabase.channel(`womp:${activeId}`).send({
+            type: 'broadcast',
+            event: 'new-message',
+            payload: {
+              msgId: serverId,
+              senderId: current.id,
+              ciphertext: encrypted.ciphertext,
+              iv: encrypted.iv
+            }
           });
         } else {
           // Simulation auto-reply behavior!
