@@ -450,8 +450,8 @@ export default function App() {
                     </div>
                     <div className="chat-user-details">
                       <span className="chat-user-name">@{activeFriend?.username}</span>
-                      <span className={`chat-user-status ${activeFriend?.isOnline ? 'online' : ''}`}>
-                        {activeFriend?.isOnline ? 'aktif' : 'tidak aktif'}
+                      <span className="chat-user-status">
+                        aktif
                       </span>
                     </div>
                   </div>
@@ -475,19 +475,16 @@ export default function App() {
                     return (
                       <div key={msg.id} className={`message-bubble ${isMe ? 'sent' : 'received'}`}>
                         <div className="message-content">
-                          {msg.text}
+                          {msg.content}
 
-                          {/* Mini info overlay with padlock and deliver tick */}
+                          {/* Mini info overlay */}
                           <div className="message-info">
-                            <span>{formatTime(msg.timestamp)}</span>
+                            <span>{formatTime(msg.createdAt)}</span>
                             {isMe && (
                               <span style={{ fontSize: '9px', fontWeight: 600 }}>
-                                {msg.isDelivered ? 'dibaca' : 'terkirim'}
+                                {msg.isRead ? 'dibaca' : 'terkirim'}
                               </span>
                             )}
-                            <span className="security-indicator" title="Pesan Terenkripsi AES-GCM">
-                              <Lock size={8} />
-                            </span>
                           </div>
                         </div>
                       </div>
