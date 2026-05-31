@@ -38,7 +38,7 @@ export default function Register() {
             <CloudOff size={16} />
             <div>
               <strong>Mode Simulasi Aktif</strong><br />
-              Supabase belum terhubung. Kunci obrolan disimpan aman di IndexedDB browser kamu.
+              InsForge belum terhubung. Kunci obrolan disimpan aman di IndexedDB browser kamu.
             </div>
           </div>
         )}

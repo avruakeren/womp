@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { supabase, isSupabaseConfigured } from '../lib/supabase';
+import { insforge, isInsforgeConfigured } from '../lib/insforge';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -74,54 +74,46 @@ async function hashPassword(password: string, username: string): Promise<string>
 // ─── Store ────────────────────────────────────────────────────────────────────
 
 export const useChatStore = create<ChatStore>((set, get) => {
-  let realtimeChannel: ReturnType<typeof supabase.channel> | null = null;
-
   const setupRealtime = (userId: string) => {
-    if (!isSupabaseConfigured()) return;
-    if (realtimeChannel) {
-      realtimeChannel.unsubscribe();
-      realtimeChannel = null;
-    }
+    if (!isInsforgeConfigured()) return;
 
-    realtimeChannel = supabase
-      .channel(`womp_user_${userId}`)
-      // New incoming messages
-      .on(
-        'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'messages', filter: `recipient_id=eq.${userId}` },
-        (payload) => {
-          const row = payload.new as any;
-          const msg: Message = {
-            id: row.id,
-            senderId: row.sender_id,
-            recipientId: row.recipient_id,
-            content: row.content,
-            isRead: row.is_read,
-            createdAt: row.created_at,
-          };
-          set((state) => {
-            const existing = state.messages[msg.senderId] || [];
-            if (existing.some(m => m.id === msg.id)) return state;
-            return {
-              messages: { ...state.messages, [msg.senderId]: [...existing, msg] },
-            };
-          });
-        }
-      )
-      // Friend request updates
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'friendships' },
-        () => { get().syncData(userId); }
-      )
-      .subscribe();
+    insforge.realtime.connect();
+
+    insforge.realtime.subscribe(`womp_user_${userId}`);
+
+    insforge.realtime.on('new_message', (payload: any) => {
+      const currentUser = get().currentUser;
+      if (!currentUser) return;
+      if (payload.recipient_id !== currentUser.id) return;
+
+      const msg: Message = {
+        id: payload.id,
+        senderId: payload.sender_id,
+        recipientId: payload.recipient_id,
+        content: payload.content,
+        isRead: payload.is_read,
+        createdAt: payload.created_at,
+      };
+
+      set((state) => {
+        const existing = state.messages[msg.senderId] || [];
+        if (existing.some(m => m.id === msg.id)) return state;
+        return {
+          messages: { ...state.messages, [msg.senderId]: [...existing, msg] },
+        };
+      });
+    });
+
+    insforge.realtime.on('friendship_updated', () => {
+      get().syncData(userId);
+    });
   };
 
   return {
     currentUser: null,
     isAuthenticated: false,
     isLoading: false,
-    isLiveMode: isSupabaseConfigured(),
+    isLiveMode: isInsforgeConfigured(),
     friends: [],
     pendingRequests: [],
     activeFriendId: null,
@@ -143,7 +135,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
       try {
         const user = JSON.parse(raw) as UserProfile;
         set({ currentUser: user, isAuthenticated: true });
-        if (isSupabaseConfigured()) {
+        if (isInsforgeConfigured()) {
           setupRealtime(user.id);
           await get().syncData(user.id);
         }
@@ -160,9 +152,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
         if (!clean || clean.length < 3) throw new Error('Username minimal 3 karakter.');
         if (!password || password.length < 6) throw new Error('Password minimal 6 karakter.');
 
-        if (isSupabaseConfigured()) {
-          // Check existing username
-          const { data: existing } = await supabase
+        if (isInsforgeConfigured()) {
+          const { data: existing } = await insforge.database
             .from('profiles')
             .select('id')
             .eq('username', clean)
@@ -172,9 +163,9 @@ export const useChatStore = create<ChatStore>((set, get) => {
 
           const passwordHash = await hashPassword(password, clean);
 
-          const { data, error } = await supabase
+          const { data, error } = await insforge.database
             .from('profiles')
-            .insert({ username: clean, password_hash: passwordHash })
+            .insert([{ username: clean, password_hash: passwordHash }])
             .select('id, username, avatar_url')
             .single();
 
@@ -186,7 +177,6 @@ export const useChatStore = create<ChatStore>((set, get) => {
           setupRealtime(user.id);
           await get().syncData(user.id);
         } else {
-          // Simulation
           const user: UserProfile = { id: uid(), username: clean };
           localStorage.setItem('womp-user', JSON.stringify(user));
           set({ currentUser: user, isAuthenticated: true });
@@ -209,8 +199,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
       try {
         const clean = username.toLowerCase().trim();
 
-        if (isSupabaseConfigured()) {
-          const { data: profile, error } = await supabase
+        if (isInsforgeConfigured()) {
+          const { data: profile, error } = await insforge.database
             .from('profiles')
             .select('*')
             .eq('username', clean)
@@ -245,8 +235,11 @@ export const useChatStore = create<ChatStore>((set, get) => {
 
     // ── Logout ─────────────────────────────────────────────────────────────
     logoutUser: () => {
-      realtimeChannel?.unsubscribe();
-      realtimeChannel = null;
+      const user = get().currentUser;
+      if (user) {
+        insforge.realtime.unsubscribe(`womp_user_${user.id}`);
+      }
+      insforge.realtime.disconnect();
       localStorage.removeItem('womp-user');
       set({ currentUser: null, isAuthenticated: false, friends: [], pendingRequests: [], messages: {}, activeFriendId: null });
     },
@@ -269,8 +262,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
       }
 
       try {
-        if (isSupabaseConfigured()) {
-          const { data: targetProfile } = await supabase
+        if (isInsforgeConfigured()) {
+          const { data: targetProfile } = await insforge.database
             .from('profiles')
             .select('id, username')
             .eq('username', target)
@@ -281,24 +274,33 @@ export const useChatStore = create<ChatStore>((set, get) => {
             return false;
           }
 
-          const { data: existing } = await supabase
+          const { data: existing1 } = await insforge.database
             .from('friendships')
             .select('id')
-            .or(`and(requester_id.eq.${current.id},addressee_id.eq.${targetProfile.id}),and(requester_id.eq.${targetProfile.id},addressee_id.eq.${current.id})`)
+            .eq('requester_id', current.id)
+            .eq('addressee_id', targetProfile.id)
             .maybeSingle();
 
-          if (existing) {
+          const { data: existing2 } = await insforge.database
+            .from('friendships')
+            .select('id')
+            .eq('requester_id', targetProfile.id)
+            .eq('addressee_id', current.id)
+            .maybeSingle();
+
+          if (existing1 || existing2) {
             get().addToast('Request sudah pernah dikirim.', 'warning');
             return false;
           }
 
-          const { error } = await supabase.from('friendships').insert({
+          const { error } = await insforge.database.from('friendships').insert([{
             requester_id: current.id,
             addressee_id: targetProfile.id,
-          });
+          }]);
           if (error) throw error;
+
+          insforge.realtime.publish(`womp_user_${targetProfile.id}`, 'friendship_updated', {});
         } else {
-          // Simulation: auto-accept after 1s
           setTimeout(() => {
             const newFriend = { id: 'sim-' + target, username: target };
             set(s => ({ friends: [...s.friends, newFriend] }));
@@ -320,8 +322,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
       if (!req) return;
 
       try {
-        if (isSupabaseConfigured()) {
-          const { error } = await supabase
+        if (isInsforgeConfigured()) {
+          const { error } = await insforge.database
             .from('friendships')
             .update({ status: 'accepted' })
             .eq('id', requestId);
@@ -333,8 +335,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
           pendingRequests: s.pendingRequests.filter(r => r.id !== requestId),
         }));
 
-        // Fetch offline messages from this friend
-        if (isSupabaseConfigured() && get().currentUser) {
+        if (isInsforgeConfigured() && get().currentUser) {
           await get().syncData(get().currentUser!.id);
         }
 
@@ -347,8 +348,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
     // ── Reject ─────────────────────────────────────────────────────────────
     rejectFriendRequest: async (requestId) => {
       try {
-        if (isSupabaseConfigured()) {
-          await supabase.from('friendships').delete().eq('id', requestId);
+        if (isInsforgeConfigured()) {
+          await insforge.database.from('friendships').delete().eq('id', requestId);
         }
         set(s => ({ pendingRequests: s.pendingRequests.filter(r => r.id !== requestId) }));
       } catch (err: any) {
@@ -359,9 +360,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
     // ── Select chat ────────────────────────────────────────────────────────
     selectActiveChat: (friendId) => {
       set({ activeFriendId: friendId });
-      // Mark messages as read
-      if (isSupabaseConfigured() && get().currentUser) {
-        supabase
+      if (isInsforgeConfigured() && get().currentUser) {
+        insforge.database
           .from('messages')
           .update({ is_read: true })
           .eq('sender_id', friendId)
@@ -379,7 +379,6 @@ export const useChatStore = create<ChatStore>((set, get) => {
 
       const text = content.trim();
 
-      // Optimistic UI update
       const tempMsg: Message = {
         id: uid(),
         senderId: current.id,
@@ -397,16 +396,15 @@ export const useChatStore = create<ChatStore>((set, get) => {
       }));
 
       try {
-        if (isSupabaseConfigured()) {
-          const { data, error } = await supabase
+        if (isInsforgeConfigured()) {
+          const { data, error } = await insforge.database
             .from('messages')
-            .insert({ sender_id: current.id, recipient_id: friendId, content: text })
+            .insert([{ sender_id: current.id, recipient_id: friendId, content: text }])
             .select('id')
             .single();
 
           if (error) throw error;
 
-          // Replace temp ID with real server ID
           set(s => ({
             messages: {
               ...s.messages,
@@ -415,8 +413,16 @@ export const useChatStore = create<ChatStore>((set, get) => {
               ),
             },
           }));
+
+          insforge.realtime.publish(`womp_user_${friendId}`, 'new_message', {
+            id: data.id,
+            sender_id: current.id,
+            recipient_id: friendId,
+            content: text,
+            is_read: false,
+            created_at: new Date().toISOString(),
+          });
         } else {
-          // Simulation reply
           setTimeout(() => {
             const reply: Message = {
               id: uid(),
@@ -432,7 +438,6 @@ export const useChatStore = create<ChatStore>((set, get) => {
           }, 1000);
         }
       } catch (err: any) {
-        // Remove optimistic message on failure
         set(s => ({
           messages: {
             ...s.messages,
@@ -451,7 +456,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
       set(s => ({ currentUser: { ...s.currentUser!, avatarUrl: dataUrl } }));
       localStorage.setItem('womp-user', JSON.stringify({ ...current, avatarUrl: dataUrl }));
 
-      if (!isSupabaseConfigured()) return;
+      if (!isInsforgeConfigured()) return;
 
       try {
         get().addToast('Mengupload foto...', 'info');
@@ -463,21 +468,20 @@ export const useChatStore = create<ChatStore>((set, get) => {
         const ext = mime.split('/')[1] || 'jpg';
         const fileName = `${current.id}.${ext}`;
 
-        const { error: uploadErr } = await supabase.storage
+        const { data: uploadData, error: uploadErr } = await insforge.storage
           .from('avatars')
-          .upload(fileName, blob, { upsert: true, contentType: mime });
+          .upload(fileName, blob);
 
         if (uploadErr) throw uploadErr;
+        if (!uploadData) throw new Error('Upload gagal: tidak ada data');
 
-        const { data: urlData } = supabase.storage.from('avatars').getPublicUrl(fileName);
-
-        await supabase
+        await insforge.database
           .from('profiles')
-          .update({ avatar_url: urlData.publicUrl })
+          .update({ avatar_url: uploadData.url })
           .eq('id', current.id);
 
-        set(s => ({ currentUser: { ...s.currentUser!, avatarUrl: urlData.publicUrl } }));
-        localStorage.setItem('womp-user', JSON.stringify({ ...current, avatarUrl: urlData.publicUrl }));
+        set(s => ({ currentUser: { ...s.currentUser!, avatarUrl: uploadData.url } }));
+        localStorage.setItem('womp-user', JSON.stringify({ ...current, avatarUrl: uploadData.url }));
         get().addToast('Foto profil diperbarui!', 'success');
       } catch (err: any) {
         get().addToast('Gagal upload foto.', 'warning');
@@ -491,18 +495,14 @@ export const useChatStore = create<ChatStore>((set, get) => {
       if (clean === current.username) return true;
 
       try {
-        if (isSupabaseConfigured()) {
-          const { error } = await supabase
+        if (isInsforgeConfigured()) {
+          const { error } = await insforge.database
             .from('profiles')
             .update({ username: clean })
             .eq('id', current.id);
 
           if (error) {
-            if (error.code === '23505') { // Unique violation
-              get().addToast('Username sudah dipakai orang lain!', 'warning');
-            } else {
-              get().addToast('Gagal update username.', 'warning');
-            }
+            get().addToast('Gagal update username.', 'warning');
             return false;
           }
         }
@@ -520,11 +520,10 @@ export const useChatStore = create<ChatStore>((set, get) => {
 
     // ── Sync data ──────────────────────────────────────────────────────────
     syncData: async (userId) => {
-      if (!isSupabaseConfigured()) return;
+      if (!isInsforgeConfigured()) return;
 
       try {
-        // 1. Load accepted friends
-        const { data: friendships } = await supabase
+        const { data: friendships } = await insforge.database
           .from('friendships')
           .select('id, requester_id, addressee_id, status')
           .or(`requester_id.eq.${userId},addressee_id.eq.${userId}`)
@@ -536,7 +535,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
           );
 
           if (partnerIds.length > 0) {
-            const { data: profiles } = await supabase
+            const { data: profiles } = await insforge.database
               .from('profiles')
               .select('id, username, avatar_url')
               .in('id', partnerIds);
@@ -552,8 +551,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
           }
         }
 
-        // 2. Pending requests
-        const { data: pending } = await supabase
+        const { data: pending } = await insforge.database
           .from('friendships')
           .select('id, requester_id')
           .eq('addressee_id', userId)
@@ -561,7 +559,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
 
         if (pending && pending.length > 0) {
           const senderIds = pending.map(p => p.requester_id);
-          const { data: senderProfiles } = await supabase
+          const { data: senderProfiles } = await insforge.database
             .from('profiles')
             .select('id, username, avatar_url')
             .in('id', senderIds);
@@ -578,8 +576,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
           set({ pendingRequests: [] });
         }
 
-        // 3. Load unread messages (offline queue)
-        const { data: unread } = await supabase
+        const { data: unread } = await insforge.database
           .from('messages')
           .select('*')
           .eq('recipient_id', userId)

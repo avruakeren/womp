@@ -419,7 +419,7 @@ export default function Home() {
               <Database size={16} />
               <div>
                 <strong>Info Akun</strong><br />
-                Penyimpanan: Supabase Postgres
+                Penyimpanan: InsForge
               </div>
             </div>
 
